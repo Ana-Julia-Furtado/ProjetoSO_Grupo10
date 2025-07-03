@@ -39,7 +39,11 @@
 #include "spinlock.h"
 #include "arch_proto.h"
 
+#include <sys/types.h>
+
 #include <minix/syslib.h>
+
+#define	RAND_MAX	0x7fffffff
 
 /* Scheduling and message passing functions */
 static void idle(void);
@@ -1779,38 +1783,96 @@ void dequeue(struct proc *rp)
 #endif
 }
 
-/*===========================================================================*
- *				pick_proc				     * 
- *===========================================================================*/
+// Função para gerar números pseudoaleatórios utilizada no sorteio dos tickets;
+// O valor da seed é responsável por determinar a sequência desses números "aleatórios".
+// Tal valor pode ser modificado conforme necessário
+int rand_custom(void) {
+    static unsigned long seed = 2;  
+    seed = (seed * 1664525 + 1013904223) % ((unsigned long)RAND_MAX + 1);
+    return (int)seed;
+}
+
+//	pick_proc				    
 static struct proc * pick_proc(void)
 {
-/* Decide who to run now.  A new process is selected and returned.
- * When a billable process is selected, record it in 'bill_ptr', so that the 
- * clock task can tell who to bill for system time.
+/* Decide quem deve executar agora. Um novo processo é selecionado e retornado.
+ * Quando um processo faturável é selecionado, registramos em 'bill_ptr', para que
+ * a tarefa do relógio saiba quem deve ser cobrado pelo tempo de sistema.
  *
- * This function always uses the run queues of the local cpu!
+ * Esta função sempre usa as filas de execução da CPU local!
  */
-  register struct proc *rp;			/* process to run */
-  struct proc **rdy_head;
-  int q;				/* iterate over queues */
 
-  /* Check each of the scheduling queues for ready processes. The number of
-   * queues is defined in proc.h, and priorities are set in the task table.
-   * If there are no processes ready to run, return NULL.
-   */
+  // Quantidade de processos prontos em cada fila
+  int processo_pronto[7] = { 0 }, tickets_por_fila[7] = { 0 };
+  int tickets = 0; // total de tickets distribuídos
+  int ticket_sorteado, soma_acumulada = 0, fila_com_ticket = 7;
+  int ticket; // calcular menor ticket
+	int num_fila, num_processo;
+
+  register struct proc *rp;			
+  struct proc **rdy_head;
+  int q;	/* iteração pelas filas */
+
   rdy_head = get_cpulocal_var(run_q_head);
-  for (q=0; q < NR_SCHED_QUEUES; q++) {	
-	if(!(rp = rdy_head[q])) {
+  for (q = 0; q < NR_SCHED_QUEUES; q++) {
+	if (q >= 7 && q <= 14) {
+        // Pular as filas de usuário (serão tratadas com loteria)
+        continue;
+    }
+	if (!(rp = rdy_head[q])) {
 		TRACE(VF_PICKPROC, printf("cpu %d queue %d empty\n", cpuid, q););
 		continue;
 	}
+
 	assert(proc_is_runnable(rp));
 	if (priv(rp)->s_flags & BILLABLE)	 	
-		get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
+		get_cpulocal_var(bill_ptr) = rp; /* cobrar tempo de sistema */
 	return rp;
   }
+
+  // Distribuição de prioridade 
+  for (int i = 0; i <= NR_TASKS + NR_PROCS; i++) {
+      register struct proc process = proc[i];
+      if (process.p_priority <= 14 && process.p_priority >= 7) {
+          const int fila_prioridade = process.p_priority;
+          // Processo é de usuário!
+          if (rts_f_is_runnable(process.p_rts_flags)) {
+              processo_pronto[7 - fila_prioridade]++;
+          }
+      }
+  }
+
+  // Soma dos tickets distribuídos
+  for (q = 7; q < 15; q++) {
+	num_fila = 16 - q;
+	num_processo = 7 - q;
+    ticket = (num_fila) * processo_pronto[num_processo];
+    tickets_por_fila[7 - q] = ticket;
+    tickets += ticket;
+  }
+
+  ticket_sorteado = rand_c() % tickets + 1;
+  //printf("sorteado:%d\n", ticket_sorteado);
+
+  for (q = 7; q < 15; q++) {
+      ticket = tickets_por_fila[7 - q];
+      soma_acumulada += ticket;
+      if (ticket_sorteado <= soma_acumulada) {
+          fila_com_ticket = q; // fila sorteada
+          break;
+      }
+  }
+
+  if ((rp = rdy_head[fila_com_ticket]) && proc_is_runnable(rp)) {
+      if (priv(rp)->s_flags & BILLABLE) {
+            get_cpulocal_var(bill_ptr) = rp;
+      }
+      return rp;
+  }
+
   return NULL;
 }
+
 
 /*===========================================================================*
  *				endpoint_lookup				     *
