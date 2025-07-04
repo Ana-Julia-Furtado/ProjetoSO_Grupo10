@@ -1837,7 +1837,7 @@ static struct proc * pick_proc(void)
           const int fila_prioridade = process.p_priority;
           // Processo é de usuário!
           if (rts_f_is_runnable(process.p_rts_flags)) {
-              processo_pronto[7 - fila_prioridade]++;
+              processo_pronto[fila_prioridade - 7]++;
           }
       }
   }
@@ -1845,17 +1845,17 @@ static struct proc * pick_proc(void)
   // Soma dos tickets distribuídos
   for (q = 7; q < 15; q++) {
 	num_fila = 16 - q;
-	num_processo = 7 - q;
+	num_processo = q - 7;
     ticket = (num_fila) * processo_pronto[num_processo];
-    tickets_por_fila[7 - q] = ticket;
+    tickets_por_fila[q - 7] = ticket;
     tickets += ticket;
   }
 
-  ticket_sorteado = rand_c() % tickets + 1;
+  ticket_sorteado = rand_custom() % tickets + 1;
   //printf("sorteado:%d\n", ticket_sorteado);
 
   for (q = 7; q < 15; q++) {
-      ticket = tickets_por_fila[7 - q];
+      ticket = tickets_por_fila[q - 7];
       soma_acumulada += ticket;
       if (ticket_sorteado <= soma_acumulada) {
           fila_com_ticket = q; // fila sorteada
