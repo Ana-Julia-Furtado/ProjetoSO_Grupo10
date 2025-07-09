@@ -45,6 +45,9 @@
 
 #define	RAND_MAX	0x7fffffff
 
+static u_long next = 1; // utilizado em rand_c
+
+
 /* Scheduling and message passing functions */
 static void idle(void);
 /**
@@ -1783,87 +1786,96 @@ void dequeue(struct proc *rp)
 #endif
 }
 
-// Função para gerar números pseudoaleatórios utilizada no sorteio dos tickets;
-// O valor da seed é responsável por determinar a sequência desses números "aleatórios".
-// Tal valor pode ser modificado conforme necessário
-int rand_custom(void) {
-    static unsigned long seed = 2;  
-    seed = (seed * 1664525 + 1013904223) % ((unsigned long)RAND_MAX + 1);
-    return (int)seed;
+// Função para gerar números aleatórios
+
+int
+rand_c(void)
+{
+	/* LINTED integer overflow */
+	return (int)((next = next * 1103515245 + 12345) % ((u_long)RAND_MAX + 1));
 }
+
 
 //	pick_proc				    
 static struct proc * pick_proc(void)
 {
-/* Decide quem deve executar agora. Um novo processo é selecionado e retornado.
- * Quando um processo faturável é selecionado, registramos em 'bill_ptr', para que
- * a tarefa do relógio saiba quem deve ser cobrado pelo tempo de sistema.
+/* Decide who to run now.  A new process is selected and returned.
+ * When a billable process is selected, record it in 'bill_ptr', so that the 
+ * clock task can tell who to bill for system time.
  *
- * Esta função sempre usa as filas de execução da CPU local!
+ * This function always uses the run queues of the local cpu!
  */
 
   // Quantidade de processos prontos em cada fila
-  int processo_pronto[7] = { 0 }, tickets_por_fila[7] = { 0 };
-  int tickets = 0; // total de tickets distribuídos
-  int ticket_sorteado, soma_acumulada = 0, fila_com_ticket = 7;
-  int ticket; // calcular menor ticket
-	int num_fila, num_processo;
+  int processes_ready[7] = { 0 };
+  int tickets_in_every_queue[7] = { 0 };
+
+  // Quantidade total de tíquetes distribuídos
+  int tickets = 0;
+
+  // Tíquete escolhido (sorte grande)
+  int chosen_ticket, acc_sum = 0, min_ticket_queue = 7;
+
+  // Usado durante cálculo do menor ticket
+  int ticket;
 
   register struct proc *rp;			
   struct proc **rdy_head;
-  int q;	/* iteração pelas filas */
+  int q;				/* iterate over queues */
 
   rdy_head = get_cpulocal_var(run_q_head);
-  for (q = 0; q < NR_SCHED_QUEUES; q++) {
-	if (q >= 7 && q <= 14) {
-        // Pular as filas de usuário (serão tratadas com loteria)
-        continue;
+  for (q=0; q < NR_SCHED_QUEUES; q++) {
+    if (q == 7) {
+        // Pular todo o espaço de usuário
+        // Usar round-robin padrão apenas para processos de sistema e processos em IDLE
+        q += 8;
     }
-	if (!(rp = rdy_head[q])) {
+	if(!(rp = rdy_head[q])) {
 		TRACE(VF_PICKPROC, printf("cpu %d queue %d empty\n", cpuid, q););
 		continue;
 	}
 
 	assert(proc_is_runnable(rp));
 	if (priv(rp)->s_flags & BILLABLE)	 	
-		get_cpulocal_var(bill_ptr) = rp; /* cobrar tempo de sistema */
+		get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
 	return rp;
   }
 
-  // Distribuição de prioridade 
+
+  // Fazer distribuição de pesos
+  // Checando quantidade de processos executáveis em cada lista
   for (int i = 0; i <= NR_TASKS + NR_PROCS; i++) {
       register struct proc process = proc[i];
       if (process.p_priority <= 14 && process.p_priority >= 7) {
-          const int fila_prioridade = process.p_priority;
+          const int priority_queue = process.p_priority;
           // Processo é de usuário!
-          if (rts_f_is_runnable(process.p_rts_flags)) {
-              processo_pronto[fila_prioridade - 7]++;
+          if(rts_f_is_runnable(process.p_rts_flags)) {
+              processes_ready[7-priority_queue]++;
           }
       }
   }
 
   // Soma dos tickets distribuídos
   for (q = 7; q < 15; q++) {
-	num_fila = 16 - q;
-	num_processo = q - 7;
-    ticket = (num_fila) * processo_pronto[num_processo];
-    tickets_por_fila[q - 7] = ticket;
-    tickets += ticket;
+      ticket = (16-q) * processes_ready[7-q];
+      tickets_in_every_queue[7-q] = ticket;
+      tickets += ticket;
   }
 
-  ticket_sorteado = rand_custom() % tickets + 1;
-  //printf("sorteado:%d\n", ticket_sorteado);
+  chosen_ticket = rand_c() % tickets + 1;
+  //printf("sorteado:%d\n", chosen_ticket);
 
   for (q = 7; q < 15; q++) {
-      ticket = tickets_por_fila[q - 7];
-      soma_acumulada += ticket;
-      if (ticket_sorteado <= soma_acumulada) {
-          fila_com_ticket = q; // fila sorteada
+      ticket = tickets_in_every_queue[7-q];
+      acc_sum += ticket;
+      if (chosen_ticket <= acc_sum) {
+          min_ticket_queue = q; // fila sorteada
           break;
       }
   }
 
-  if ((rp = rdy_head[fila_com_ticket]) && proc_is_runnable(rp)) {
+
+  if ((rp = rdy_head[min_ticket_queue]) && proc_is_runnable(rp)) {
       if (priv(rp)->s_flags & BILLABLE) {
             get_cpulocal_var(bill_ptr) = rp;
       }
@@ -1872,7 +1884,6 @@ static struct proc * pick_proc(void)
 
   return NULL;
 }
-
 
 /*===========================================================================*
  *				endpoint_lookup				     *
