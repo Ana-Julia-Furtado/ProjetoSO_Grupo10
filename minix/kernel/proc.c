@@ -39,14 +39,24 @@
 #include "spinlock.h"
 #include "arch_proto.h"
 
-#include <sys/types.h>
-
 #include <minix/syslib.h>
 
-#define	RAND_MAX	0x7fffffff
+#define MAX_TICKETS 20 // Numero maximo de tickets
+#define MAX_USER_PRIORITY_Q 14 // Última fila de prioridade de usuario
+#define MIN_USER_PRIORITY_Q 7  // Primeira fila de prioridade de usuario
+#define BASE_TICKETS_PER_PRIORITY 5 // Novo valor base de tickets
+#define PRIORITY_WEIGHT_FACTOR 2   // Fator de peso para a prioridade (ex: 1, 2, etc.)
+static unsigned int xorshift_state = 123456789; // Inicialize com um valor não zero
 
-static u_long next = 1; // utilizado em rand_c
-
+int rando(void) {
+    // Xorshift32 - rápido e geralmente melhor que LCG simples para non-cryptographic use
+    unsigned int x = xorshift_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    xorshift_state = x;
+    return (int)(x % 32768); // Mantenha a faixa de retorno se necessário
+}
 
 /* Scheduling and message passing functions */
 static void idle(void);
@@ -1786,17 +1796,9 @@ void dequeue(struct proc *rp)
 #endif
 }
 
-// Função para gerar números aleatórios
-
-int
-rand_c(void)
-{
-	/* LINTED integer overflow */
-	return (int)((next = next * 1103515245 + 12345) % ((u_long)RAND_MAX + 1));
-}
-
-
-//	pick_proc				    
+/*===========================================================================*
+ *				pick_proc				     * 
+ *===========================================================================*/
 static struct proc * pick_proc(void)
 {
 /* Decide who to run now.  A new process is selected and returned.
@@ -1805,81 +1807,74 @@ static struct proc * pick_proc(void)
  *
  * This function always uses the run queues of the local cpu!
  */
-
-  // Quantidade de processos prontos em cada fila
-  int processes_ready[7] = { 0 };
-  int tickets_in_every_queue[7] = { 0 };
-
-  // Quantidade total de tíquetes distribuídos
-  int tickets = 0;
-
-  // Tíquete escolhido (sorte grande)
-  int chosen_ticket, acc_sum = 0, min_ticket_queue = 7;
-
-  // Usado durante cálculo do menor ticket
-  int ticket;
-
-  register struct proc *rp;			
+  register struct proc *rp;			/* process to run */
   struct proc **rdy_head;
   int q;				/* iterate over queues */
 
+  /* Check each of the scheduling queues for ready processes. The number of
+   * queues is defined in proc.h, and priorities are set in the task table.
+   * If there are no processes ready to run, return NULL.
+   */
+  register struct proc *aux; /* MODIFICADO: ponteiro que ira percorrer as filas */
+  int total_tickets = 0; /* MODIFICADO: variavel para guardar o total de tickets */
   rdy_head = get_cpulocal_var(run_q_head);
-  for (q=0; q < NR_SCHED_QUEUES; q++) {
-    if (q == 7) {
-        // Pular todo o espaço de usuário
-        // Usar round-robin padrão apenas para processos de sistema e processos em IDLE
-        q += 8;
+
+  /* MODIFICADO: percorrer todos os processos, atribuindo os tickets e somando a variavel que acumula o total */
+  for (q = MIN_USER_PRIORITY_Q; q <= MAX_USER_PRIORITY_Q; q++) {
+    aux = rdy_head[q];
+    while(aux) {
+        // Combina um valor base com um peso baseado na prioridade.
+        // Quanto menor 'q' (maior prioridade), maior (MAX_USER_PRIORITY_Q - q + 1)
+        aux->p_tickets = BASE_TICKETS_PER_PRIORITY + ((MAX_USER_PRIORITY_Q - q + 1) * PRIORITY_WEIGHT_FACTOR);
+        total_tickets += aux->p_tickets;
+        aux = aux->p_nextready;
     }
-	if(!(rp = rdy_head[q])) {
-		TRACE(VF_PICKPROC, printf("cpu %d queue %d empty\n", cpuid, q););
-		continue;
-	}
-
-	assert(proc_is_runnable(rp));
-	if (priv(rp)->s_flags & BILLABLE)	 	
-		get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
-	return rp;
   }
 
-
-  // Fazer distribuição de pesos
-  // Checando quantidade de processos executáveis em cada lista
-  for (int i = 0; i <= NR_TASKS + NR_PROCS; i++) {
-      register struct proc process = proc[i];
-      if (process.p_priority <= 14 && process.p_priority >= 7) {
-          const int priority_queue = process.p_priority;
-          // Processo é de usuário!
-          if(rts_f_is_runnable(process.p_rts_flags)) {
-              processes_ready[7-priority_queue]++;
-          }
-      }
+  /* Check each of the scheduling queues for ready processes. The number of
+   * queues is defined in proc.h, and priorities are set in the task table.
+   * If there are no processes ready to run, return NULL.
+   */
+  for (q=0; q < 7; q++) { // Filas de alta prioridade (0-6) ainda são verificadas primeiro.
+    if(!(rp = rdy_head[q])) {
+        TRACE(VF_PICKPROC, printf("cpu %d queue %d empty\n", cpuid, q););
+        continue;
+    }
+    assert(proc_is_runnable(rp));
+    if (priv(rp)->s_flags & BILLABLE)
+        get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
+    return rp;
   }
 
-  // Soma dos tickets distribuídos
-  for (q = 7; q < 15; q++) {
-      ticket = (16-q) * processes_ready[7-q];
-      tickets_in_every_queue[7-q] = ticket;
-      tickets += ticket;
+  if(total_tickets > 0) { /* se tem processo de usuario pronto */
+    /* MODIFICADO: realizacao da loteria */
+    int random = (rando()%total_tickets)+1; /* MODIFICADO: variavel que recebe o ticket sorteado */
+    int winner = 0; /* MODIFICADO: variavel para acumular os tickets, ateh que se encontre o vencedor */
+
+    for (q=7; q <= 14; q++) { // Loop para as filas de prioridade de usuário
+        aux = rdy_head[q];
+        while(aux) {
+            winner += aux->p_tickets;
+            if(winner >= random) {
+                assert(proc_is_runnable(aux));
+                if (priv(aux)->s_flags & BILLABLE)
+                    get_cpulocal_var(bill_ptr) = aux; /* bill for system time */
+                return aux;
+            }
+            aux = aux->p_nextready;
+        }
+    }
   }
 
-  chosen_ticket = rand_c() % tickets + 1;
-  //printf("sorteado:%d\n", chosen_ticket);
-
-  for (q = 7; q < 15; q++) {
-      ticket = tickets_in_every_queue[7-q];
-      acc_sum += ticket;
-      if (chosen_ticket <= acc_sum) {
-          min_ticket_queue = q; // fila sorteada
-          break;
-      }
-  }
-
-
-  if ((rp = rdy_head[min_ticket_queue]) && proc_is_runnable(rp)) {
-      if (priv(rp)->s_flags & BILLABLE) {
-            get_cpulocal_var(bill_ptr) = rp;
-      }
-      return rp;
+  for (q=15; q <= 15; q++) { // Fila de baixa prioridade (15) ainda e verificada por último
+    if(!(rp = rdy_head[q])) {
+        TRACE(VF_PICKPROC, printf("cpu %d queue %d empty\n", cpuid, q););
+        continue;
+    }
+    assert(proc_is_runnable(rp));
+    if (priv(rp)->s_flags & BILLABLE)
+        get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
+    return rp;
   }
 
   return NULL;
