@@ -96,11 +96,11 @@ int do_noquantum(message *m_ptr)
 	}
 
 	rmp = &schedproc[proc_nr_n];
-	
+
 	if (rmp->priority == USER_Q) {
 		return OK;
 	}
-	
+
 	if (rmp->priority < MIN_USER_Q) {
 		rmp->priority += 1; /* lower priority */
 	}
